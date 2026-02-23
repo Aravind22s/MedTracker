@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Plus, 
@@ -20,7 +20,8 @@ import {
   Bot,
   Settings,
   Volume2,
-  Upload
+  Upload,
+  Bell
 } from 'lucide-react';
 import { useAuthStore } from './store/authStore';
 import { parseMedicineInput, ParsedMedicine } from './services/geminiService';
@@ -95,72 +96,100 @@ export default function App() {
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
   const [notificationsEnabled, setNotificationsEnabled] = useState(false);
+  const [activeReminder, setActiveReminder] = useState<any>(null);
+  const lastRemindedRef = useRef<{ [key: string]: string }>({});
+  const medicinesRef = useRef<any[]>([]);
+  const logsRef = useRef<any[]>([]);
+  const userRef = useRef<any>(null);
+
+  // Keep refs in sync with state
+  useEffect(() => {
+    medicinesRef.current = medicines;
+  }, [medicines]);
+
+  useEffect(() => {
+    logsRef.current = logs;
+  }, [logs]);
+
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
 
   useEffect(() => {
     if (token) {
       fetchData();
-      const interval = setInterval(checkReminders, 60000);
+      const interval = setInterval(checkReminders, 30000); // Check every 30s for better precision
       return () => clearInterval(interval);
     }
-  }, [token, medicines]);
+  }, [token]); // Removed medicines from dependencies to prevent infinite loop
 
-  const playReminderSound = async (soundType: string = 'default') => {
-    const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+  const playReminderSound = async (soundType: string = 'default', customDataOverride?: string | null) => {
+    const AudioContextClass = (window.AudioContext || (window as any).webkitAudioContext);
+    if (!AudioContextClass) return;
     
-    // Resume context if suspended (common browser policy)
-    if (audioCtx.state === 'suspended') {
-      await audioCtx.resume();
-    }
+    const audioCtx = new AudioContextClass();
+    
+    try {
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
 
-    if (soundType === 'custom' && user?.custom_sound_data) {
-      try {
-        const response = await fetch(user.custom_sound_data);
+      const soundData = customDataOverride !== undefined ? customDataOverride : userRef.current?.custom_sound_data;
+
+      if (soundType === 'custom' && soundData) {
+        const response = await fetch(soundData);
         const arrayBuffer = await response.arrayBuffer();
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
         const source = audioCtx.createBufferSource();
         source.buffer = audioBuffer;
         source.connect(audioCtx.destination);
         source.start();
+        
+        // Close context after playback
+        source.onended = () => audioCtx.close();
         return;
-      } catch (e) {
-        console.error("Failed to play custom sound", e);
-        // Fallback to default
       }
+
+      const oscillator = audioCtx.createOscillator();
+      const gainNode = audioCtx.createGain();
+
+      oscillator.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+
+      if (soundType === 'chime') {
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(880, audioCtx.currentTime);
+        oscillator.frequency.exponentialRampToValueAtTime(440, audioCtx.currentTime + 0.5);
+      } else if (soundType === 'pulse') {
+        oscillator.type = 'square';
+        oscillator.frequency.setValueAtTime(440, audioCtx.currentTime);
+        oscillator.frequency.setValueAtTime(660, audioCtx.currentTime + 0.1);
+        oscillator.frequency.setValueAtTime(440, audioCtx.currentTime + 0.2);
+      } else {
+        oscillator.type = 'triangle';
+        oscillator.frequency.setValueAtTime(523.25, audioCtx.currentTime); // C5
+      }
+
+      gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.5);
+
+      oscillator.start();
+      oscillator.stop(audioCtx.currentTime + 0.5);
+      
+      oscillator.onended = () => audioCtx.close();
+    } catch (e) {
+      console.error("Audio playback error", e);
+      audioCtx.close();
     }
-
-    const oscillator = audioCtx.createOscillator();
-    const gainNode = audioCtx.createGain();
-
-    oscillator.connect(gainNode);
-    gainNode.connect(audioCtx.destination);
-
-    if (soundType === 'chime') {
-      oscillator.type = 'sine';
-      oscillator.frequency.setValueAtTime(880, audioCtx.currentTime);
-      oscillator.frequency.exponentialRampToValueAtTime(440, audioCtx.currentTime + 0.5);
-    } else if (soundType === 'pulse') {
-      oscillator.type = 'square';
-      oscillator.frequency.setValueAtTime(440, audioCtx.currentTime);
-      oscillator.frequency.setValueAtTime(660, audioCtx.currentTime + 0.1);
-      oscillator.frequency.setValueAtTime(440, audioCtx.currentTime + 0.2);
-    } else {
-      oscillator.type = 'triangle';
-      oscillator.frequency.setValueAtTime(523.25, audioCtx.currentTime); // C5
-    }
-
-    gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime);
-    gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.5);
-
-    oscillator.start();
-    oscillator.stop(audioCtx.currentTime + 0.5);
   };
 
   const checkReminders = () => {
     const now = new Date();
     const currentTimeStr = format(now, 'HH:mm');
+    const todayStr = format(now, 'yyyy-MM-dd');
 
-    medicines.forEach(med => {
-      const lastLog = logs.find(l => l.medicine_id === med.id);
+    medicinesRef.current.forEach(med => {
+      const lastLog = logsRef.current.find(l => l.medicine_id === med.id);
       const isTakenToday = lastLog && isSameDay(parseISO(lastLog.taken_at), now);
       
       // Check if snoozed
@@ -168,15 +197,23 @@ export default function App() {
 
       // Check if it's time for the reminder
       const isReminderTime = med.reminder_time === currentTimeStr;
+      
+      // Unique key for this specific reminder occurrence
+      const reminderKey = `${med.id}-${todayStr}-${currentTimeStr}`;
 
-      if (!isTakenToday && !isSnoozed && isReminderTime) {
+      if (!isTakenToday && !isSnoozed && isReminderTime && !lastRemindedRef.current[reminderKey]) {
+        lastRemindedRef.current[reminderKey] = 'triggered';
         console.log(`Reminder: Time to take ${med.name}`);
-        playReminderSound(user?.reminder_sound);
+        playReminderSound(userRef.current?.reminder_sound);
         
-        // Show a simple alert if notifications aren't enabled
-        if (!notificationsEnabled) {
-          alert(`Reminder: It's time to take ${med.name} (${med.dosage})`);
+        if (notificationsEnabled && 'Notification' in window && Notification.permission === 'granted') {
+          new Notification(`Time for your ${med.name}`, {
+            body: `Dosage: ${med.dosage}. ${med.instructions || ''}`,
+            icon: '/favicon.ico'
+          });
         }
+        
+        setActiveReminder(med);
       }
     });
   };
@@ -190,15 +227,20 @@ export default function App() {
 
   const fetchData = async () => {
     try {
-      const [medsRes, logsRes, statsRes] = await Promise.all([
+      const [medsRes, logsRes, statsRes, userRes] = await Promise.all([
         fetch('/api/medicines', { headers: { Authorization: `Bearer ${token}` } }),
         fetch('/api/logs', { headers: { Authorization: `Bearer ${token}` } }),
         fetch('/api/analytics', { headers: { Authorization: `Bearer ${token}` } }),
+        fetch('/api/user/me', { headers: { Authorization: `Bearer ${token}` } }),
       ]);
       
       if (medsRes.ok) setMedicines(await medsRes.json());
       if (logsRes.ok) setLogs(await logsRes.json());
       if (statsRes.ok) setAnalytics(await statsRes.json());
+      if (userRes.ok) {
+        const userData = await userRes.json();
+        setAuth(userData, token!);
+      }
     } catch (e) {
       console.error(e);
     }
@@ -284,6 +326,11 @@ export default function App() {
     }
   };
 
+  const handleTakeNow = async () => {
+    if (!activeReminder) return;
+    await handleLogDose(activeReminder.id);
+    setActiveReminder(null);
+  };
   const handleUpdateSound = async (sound: string, customData?: string) => {
     try {
       const res = await fetch('/api/user/settings', {
@@ -898,23 +945,32 @@ export default function App() {
                 <div className="space-y-2">
                   {['default', 'chime', 'pulse', 'custom'].map((sound) => (
                     <div key={sound} className="space-y-2">
-                      <button
-                        onClick={() => handleUpdateSound(sound)}
-                        className={cn(
-                          "w-full flex items-center justify-between p-4 rounded-xl border transition-all",
-                          user?.reminder_sound === sound 
-                            ? "border-emerald-500 bg-emerald-50 text-emerald-700" 
-                            : "border-zinc-100 hover:border-zinc-200"
-                        )}
-                      >
-                        <div className="flex items-center gap-3">
-                          <span className="capitalize font-medium">{sound}</span>
-                          {sound === 'custom' && user?.custom_sound_data && (
-                            <span className="text-[10px] bg-emerald-100 text-emerald-600 px-2 py-0.5 rounded-full uppercase font-bold">Uploaded</span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => handleUpdateSound(sound)}
+                          className={cn(
+                            "flex-1 flex items-center justify-between p-4 rounded-xl border transition-all",
+                            user?.reminder_sound === sound 
+                              ? "border-emerald-500 bg-emerald-50 text-emerald-700" 
+                              : "border-zinc-100 hover:border-zinc-200"
                           )}
-                        </div>
-                        {user?.reminder_sound === sound && <CheckCircle2 className="w-5 h-5" />}
-                      </button>
+                        >
+                          <div className="flex items-center gap-3">
+                            <span className="capitalize font-medium">{sound}</span>
+                            {sound === 'custom' && user?.custom_sound_data && (
+                              <span className="text-[10px] bg-emerald-100 text-emerald-600 px-2 py-0.5 rounded-full uppercase font-bold">Uploaded</span>
+                            )}
+                          </div>
+                          {user?.reminder_sound === sound && <CheckCircle2 className="w-5 h-5" />}
+                        </button>
+                        <button 
+                          onClick={() => playReminderSound(sound)}
+                          className="p-4 rounded-xl border border-zinc-100 hover:bg-zinc-50 text-zinc-400 hover:text-emerald-600 transition-all"
+                          title="Test Sound"
+                        >
+                          <Volume2 className="w-5 h-5" />
+                        </button>
+                      </div>
                       
                       {sound === 'custom' && (
                         <div className="px-2">
@@ -936,6 +992,25 @@ export default function App() {
               </Card>
 
               <Card className="p-6">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-3">
+                    <Bell className="w-5 h-5 text-emerald-600" />
+                    <h4 className="font-bold">Notifications</h4>
+                  </div>
+                  <button 
+                    onClick={requestNotifications}
+                    className={cn(
+                      "px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-all",
+                      notificationsEnabled ? "bg-emerald-100 text-emerald-700" : "bg-zinc-100 text-zinc-500 hover:bg-zinc-200"
+                    )}
+                  >
+                    {notificationsEnabled ? "Enabled" : "Enable"}
+                  </button>
+                </div>
+                <p className="text-sm text-zinc-500">Enable desktop notifications for your medicine reminders.</p>
+              </Card>
+
+              <Card className="p-6">
                 <div className="flex items-center gap-3 mb-4">
                   <User className="w-5 h-5 text-emerald-600" />
                   <h4 className="font-bold">Account Info</h4>
@@ -954,6 +1029,62 @@ export default function App() {
                 <LogOut className="w-5 h-5" /> Sign Out
               </Button>
             </motion.div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {activeReminder && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+              <motion.div
+                initial={{ scale: 0.9, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.9, opacity: 0 }}
+                className="bg-white rounded-3xl p-8 max-w-sm w-full shadow-2xl text-center"
+              >
+                <div className="w-20 h-20 bg-emerald-100 rounded-full flex items-center justify-center mx-auto mb-6">
+                  <Bell className="w-10 h-10 text-emerald-600 animate-bounce" />
+                </div>
+                <h2 className="text-2xl font-bold mb-2">Time for {activeReminder.name}</h2>
+                <p className="text-zinc-500 mb-8">
+                  Dosage: <span className="font-bold text-zinc-900">{activeReminder.dosage}</span>
+                  {activeReminder.instructions && <><br />{activeReminder.instructions}</>}
+                </p>
+                
+                <div className="space-y-3">
+                  <Button className="w-full py-4 text-lg" onClick={handleTakeNow}>
+                    <CheckCircle2 className="w-6 h-6" /> I've Taken It
+                  </Button>
+                  
+                  <div className="grid grid-cols-2 gap-3">
+                    <button 
+                      onClick={() => {
+                        handleSnooze(activeReminder.id, 15);
+                        setActiveReminder(null);
+                      }}
+                      className="py-3 rounded-xl border border-zinc-200 font-bold text-sm hover:bg-zinc-50 transition-colors"
+                    >
+                      Snooze 15m
+                    </button>
+                    <button 
+                      onClick={() => {
+                        handleSnooze(activeReminder.id, 60);
+                        setActiveReminder(null);
+                      }}
+                      className="py-3 rounded-xl border border-zinc-200 font-bold text-sm hover:bg-zinc-50 transition-colors"
+                    >
+                      Snooze 1h
+                    </button>
+                  </div>
+                  
+                  <button 
+                    onClick={() => setActiveReminder(null)}
+                    className="w-full py-3 text-zinc-400 font-bold text-sm hover:text-zinc-600 transition-colors"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </motion.div>
+            </div>
           )}
         </AnimatePresence>
       </main>

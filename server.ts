@@ -152,6 +152,11 @@ async function startServer() {
     res.json({ success: true });
   });
 
+  app.get("/api/user/me", authenticateToken, (req: any, res) => {
+    const user = db.prepare("SELECT id, email, name, reminder_sound, custom_sound_data FROM users WHERE id = ?").get(req.user.id);
+    res.json(user);
+  });
+
   // Medicine Routes
   app.get("/api/medicines", authenticateToken, (req: any, res) => {
     const medicines = db.prepare("SELECT * FROM medicines WHERE user_id = ?").all(req.user.id);
