@@ -1,5 +1,5 @@
 {
   "name": "MedTrack AI",
   "description": "AI-powered medicine reminder and dosage tracker with natural language parsing and adherence analytics.",
-  "requestFramePermissions": []
+  "requestFramePermissions": ["microphone"]
 }

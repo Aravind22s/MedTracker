@@ -15,3 +15,35 @@ body {
   width: 0px;
   background: transparent;
 }
+
+.markdown-body {
+  @apply leading-relaxed;
+}
+
+.markdown-body p {
+  @apply mb-2 last:mb-0;
+}
+
+.markdown-body ul, .markdown-body ol {
+  @apply mb-2 ml-4 list-outside;
+}
+
+.markdown-body ul {
+  @apply list-disc;
+}
+
+.markdown-body ol {
+  @apply list-decimal;
+}
+
+.markdown-body li {
+  @apply mb-1;
+}
+
+.markdown-body strong {
+  @apply font-bold;
+}
+
+.markdown-body em {
+  @apply italic;
+}

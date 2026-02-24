@@ -6,6 +6,7 @@ interface User {
   name: string;
   reminder_sound?: string;
   custom_sound_data?: string | null;
+  language?: string;
 }
 
 interface AuthState {

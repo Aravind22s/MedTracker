@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Plus, 
@@ -21,11 +21,15 @@ import {
   Settings,
   Volume2,
   Upload,
-  Bell
+  Bell,
+  Languages,
+  Sparkles,
+  Zap,
+  MicOff
 } from 'lucide-react';
 import { useAuthStore } from './store/authStore';
 import { parseMedicineInput, ParsedMedicine } from './services/geminiService';
-import { getChatResponse, ChatMessage } from './services/chatService';
+import { getChatResponse, ChatMessage, translateText, getMedicineInsights, getBehavioralAnalysisInsights } from './services/chatService';
 import { 
   LineChart, 
   Line, 
@@ -35,15 +39,23 @@ import {
   Tooltip, 
   ResponsiveContainer,
   AreaChart,
-  Area
+  Area,
+  BarChart,
+  Bar
 } from 'recharts';
 import { format, addDays, isSameDay, parseISO } from 'date-fns';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import Markdown from 'react-markdown';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
+
+const LANGUAGES = [
+  { code: 'en', name: 'English' },
+  { code: 'ta', name: 'Tamil' },
+];
 
 // --- Components ---
 
@@ -89,14 +101,114 @@ export default function App() {
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [isChatLoading, setIsChatLoading] = useState(false);
+  const [selectedInsight, setSelectedInsight] = useState<{ name: string, content: string } | null>(null);
+  const [isInsightLoading, setIsInsightLoading] = useState(false);
+  const [behaviorAnalysis, setBehaviorAnalysis] = useState<any>(null);
+  const [behavioralInsights, setBehavioralInsights] = useState<string>('');
+  const [isBehaviorLoading, setIsBehaviorLoading] = useState(false);
+
+  // Analytics Calculations
+  const adherenceStats = useMemo(() => {
+    if (analytics.length === 0) return { streak: 0, missedLast7: 0, bestDay: 'N/A' };
+    
+    // Streak
+    let streak = 0;
+    const sorted = [...analytics].sort((a, b) => b.date.localeCompare(a.date));
+    for (const day of sorted) {
+      if (day.taken === day.total && day.total > 0) streak++;
+      else if (day.total > 0) break; // Only break if it was a day with scheduled meds
+    }
+
+    // Missed last 7 days
+    const last7 = analytics.slice(-7);
+    const missedLast7 = last7.reduce((acc, curr) => acc + (curr.total - curr.taken), 0);
+
+    // Best Day of Week
+    const dayMap: Record<string, { total: number, taken: number }> = {};
+    analytics.forEach(day => {
+      const d = format(parseISO(day.date), 'EEEE');
+      if (!dayMap[d]) dayMap[d] = { total: 0, taken: 0 };
+      dayMap[d].total += day.total;
+      dayMap[d].taken += day.taken;
+    });
+    
+    let bestDay = 'N/A';
+    let maxRate = -1;
+    Object.entries(dayMap).forEach(([day, stats]) => {
+      const rate = stats.total > 0 ? stats.taken / stats.total : 0;
+      if (rate > maxRate) {
+        maxRate = rate;
+        bestDay = day;
+      }
+    });
+
+    return { streak, missedLast7, bestDay };
+  }, [analytics]);
+
+  const medicineAdherence = useMemo(() => {
+    return medicines.map(med => {
+      const medLogs = logs.filter(l => l.medicine_id === med.id);
+      const taken = medLogs.filter(l => l.status === 'taken').length;
+      return { name: med.name, taken };
+    }).sort((a, b) => b.taken - a.taken);
+  }, [medicines, logs]);
+
+  const [isListening, setIsListening] = useState(false);
+
+  const startListening = (target: 'ai' | 'chat') => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      addToast("Speech recognition not supported in this browser", "error");
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = user?.language === 'ta' ? 'ta-IN' : 'en-US';
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = () => setIsListening(true);
+    recognition.onend = () => setIsListening(false);
+    recognition.onerror = (event: any) => {
+      console.error('Speech recognition error', event.error);
+      setIsListening(false);
+      if (event.error === 'not-allowed') {
+        addToast("Microphone access denied", "error");
+      } else if (event.error === 'no-speech') {
+        addToast("No speech detected. Please try again.", "info");
+      } else if (event.error === 'network') {
+        addToast("Network error during speech recognition", "error");
+      }
+    };
+
+    recognition.onresult = (event: any) => {
+      const transcript = event.results[0][0].transcript;
+      if (target === 'ai') {
+        setAiInput(prev => prev + (prev ? ' ' : '') + transcript);
+      } else {
+        setChatInput(prev => prev + (prev ? ' ' : '') + transcript);
+      }
+    };
+
+    recognition.start();
+  };
 
   // Auth States
   const [isLogin, setIsLogin] = useState(true);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
-  const [notificationsEnabled, setNotificationsEnabled] = useState(false);
   const [activeReminder, setActiveReminder] = useState<any>(null);
+  const [notificationHistory, setNotificationHistory] = useState<any[]>([]);
+  const [showNotifications, setShowNotifications] = useState(false);
+  const [toasts, setToasts] = useState<any[]>([]);
+
+  const addToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
+    const id = Date.now();
+    setToasts(prev => [...prev, { id, message, type }]);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 5000);
+  };
+
   const lastRemindedRef = useRef<{ [key: string]: string }>({});
   const medicinesRef = useRef<any[]>([]);
   const logsRef = useRef<any[]>([]);
@@ -116,12 +228,35 @@ export default function App() {
   }, [user]);
 
   useEffect(() => {
+    const checkHealth = async () => {
+      try {
+        const res = await fetch('/api/health');
+        if (res.ok) {
+          const text = await res.text();
+          if (!text) return;
+          
+          const contentType = res.headers.get("content-type");
+          if (contentType && contentType.includes("application/json")) {
+            const data = JSON.parse(text);
+            console.log('API Health Check:', data);
+          }
+        } else {
+          console.error('API Health Check returned non-OK status:', res.status);
+        }
+      } catch (e) {
+        console.error('API Health Check failed:', e);
+      }
+    };
+    checkHealth();
+  }, []);
+
+  useEffect(() => {
     if (token) {
       fetchData();
-      const interval = setInterval(checkReminders, 30000); // Check every 30s for better precision
+      const interval = setInterval(checkReminders, 10000); // Check every 10s for better precision
       return () => clearInterval(interval);
     }
-  }, [token]); // Removed medicines from dependencies to prevent infinite loop
+  }, [token]);
 
   const playReminderSound = async (soundType: string = 'default', customDataOverride?: string | null) => {
     const AudioContextClass = (window.AudioContext || (window as any).webkitAudioContext);
@@ -188,7 +323,11 @@ export default function App() {
     const currentTimeStr = format(now, 'HH:mm');
     const todayStr = format(now, 'yyyy-MM-dd');
 
+    if (medicinesRef.current.length === 0) return;
+
     medicinesRef.current.forEach(med => {
+      if (!med.reminder_time) return;
+
       const lastLog = logsRef.current.find(l => l.medicine_id === med.id);
       const isTakenToday = lastLog && isSameDay(parseISO(lastLog.taken_at), now);
       
@@ -203,14 +342,28 @@ export default function App() {
 
       if (!isTakenToday && !isSnoozed && isReminderTime && !lastRemindedRef.current[reminderKey]) {
         lastRemindedRef.current[reminderKey] = 'triggered';
-        console.log(`Reminder: Time to take ${med.name}`);
-        playReminderSound(userRef.current?.reminder_sound);
+        console.log(`[Reminder] Triggering for ${med.name} at ${currentTimeStr}`);
         
-        if (notificationsEnabled && 'Notification' in window && Notification.permission === 'granted') {
-          new Notification(`Time for your ${med.name}`, {
-            body: `Dosage: ${med.dosage}. ${med.instructions || ''}`,
-            icon: '/favicon.ico'
-          });
+        playReminderSound(userRef.current?.reminder_sound);
+        addToast(`Time for your ${med.name} (${med.dosage})`, 'info');
+        setNotificationHistory(prev => [{ 
+          id: Date.now(), 
+          medName: med.name, 
+          dosage: med.dosage,
+          time: currentTimeStr, 
+          date: todayStr 
+        }, ...prev].slice(0, 10));
+        
+        if (Notification.permission === 'granted') {
+          try {
+            new Notification(`Time for your ${med.name}`, {
+              body: `Dosage: ${med.dosage}. ${med.instructions || ''}`,
+              icon: '/favicon.ico',
+              tag: reminderKey // Prevent duplicate notifications for same event
+            });
+          } catch (e) {
+            console.error("Notification failed", e);
+          }
         }
         
         setActiveReminder(med);
@@ -218,31 +371,70 @@ export default function App() {
     });
   };
 
-  const requestNotifications = async () => {
-    if ('Notification' in window) {
-      const permission = await Notification.requestPermission();
-      setNotificationsEnabled(permission === 'granted');
-    }
-  };
-
   const fetchData = async () => {
     try {
-      const [medsRes, logsRes, statsRes, userRes] = await Promise.all([
+      const [medsRes, logsRes, statsRes, userRes, behaviorRes] = await Promise.all([
         fetch('/api/medicines', { headers: { Authorization: `Bearer ${token}` } }),
         fetch('/api/logs', { headers: { Authorization: `Bearer ${token}` } }),
         fetch('/api/analytics', { headers: { Authorization: `Bearer ${token}` } }),
         fetch('/api/user/me', { headers: { Authorization: `Bearer ${token}` } }),
+        fetch('/api/behavior-analysis', { headers: { Authorization: `Bearer ${token}` } }),
       ]);
       
-      if (medsRes.ok) setMedicines(await medsRes.json());
-      if (logsRes.ok) setLogs(await logsRes.json());
-      if (statsRes.ok) setAnalytics(await statsRes.json());
-      if (userRes.ok) {
-        const userData = await userRes.json();
+      const safeJson = async (res: Response) => {
+        try {
+          const text = await res.text();
+          if (!text) return null;
+          
+          const contentType = res.headers.get("content-type");
+          if (res.ok && contentType && contentType.includes("application/json")) {
+            return JSON.parse(text);
+          }
+        } catch (e) {
+          console.error('Error parsing JSON:', e);
+        }
+        return null;
+      };
+
+      const meds = await safeJson(medsRes);
+      if (meds) {
+        console.log(`[CLIENT] fetchData: Received ${meds.length} medicines`);
+        setMedicines(meds);
+      }
+
+      const logsData = await safeJson(logsRes);
+      if (logsData) setLogs(logsData);
+
+      const stats = await safeJson(statsRes);
+      if (stats) setAnalytics(stats);
+
+      const userData = await safeJson(userRes);
+      if (userData) {
         setAuth(userData, token!);
+      }
+
+      const behaviorData = await safeJson(behaviorRes);
+      if (behaviorData) {
+        setBehaviorAnalysis(behaviorData);
+        if (!behavioralInsights) {
+          generateBehavioralInsights(behaviorData);
+        }
       }
     } catch (e) {
       console.error(e);
+    }
+  };
+
+  const generateBehavioralInsights = async (data: any) => {
+    if (!data) return;
+    setIsBehaviorLoading(true);
+    try {
+      const insights = await getBehavioralAnalysisInsights(data, user?.language || 'en');
+      setBehavioralInsights(insights);
+    } catch (e) {
+      console.error("Failed to generate behavioral insights", e);
+    } finally {
+      setIsBehaviorLoading(false);
     }
   };
 
@@ -258,11 +450,28 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      const data = await res.json();
-      if (res.ok) {
-        setAuth(data.user, data.token);
+      
+      const contentType = res.headers.get("content-type");
+      const text = await res.text();
+      
+      if (contentType && contentType.includes("application/json") && text) {
+        let data: any;
+        try {
+          data = JSON.parse(text);
+        } catch (e) {
+          console.error('Failed to parse auth JSON:', e);
+          alert('Server returned invalid data. Please try again.');
+          return;
+        }
+        
+        if (res.ok) {
+          setAuth(data.user, data.token);
+        } else {
+          alert(data.error || 'Auth failed');
+        }
       } else {
-        alert(data.error);
+        console.error('Non-JSON or empty response:', text);
+        alert('Server error. Please try again later.');
       }
     } catch (e) {
       alert('Auth failed');
@@ -294,6 +503,24 @@ export default function App() {
         setEditingMedicine(null);
         fetchData();
         setAiInput('');
+      } else {
+        const contentType = res.headers.get("content-type");
+        const text = await res.text();
+        
+        if (contentType && contentType.includes("application/json") && text) {
+          let data: any;
+          try {
+            data = JSON.parse(text);
+          } catch (e) {
+            console.error('Failed to parse save error JSON:', e);
+            alert(`Failed to save medicine: Server error (${res.status})`);
+            return;
+          }
+          alert(`Failed to save medicine: ${data.error || res.statusText}`);
+        } else {
+          console.error('Non-JSON or empty error response:', text);
+          alert(`Failed to save medicine: Server error (${res.status})`);
+        }
       }
     } catch (e) {
       console.error(e);
@@ -316,7 +543,7 @@ export default function App() {
     setIsChatLoading(true);
 
     try {
-      const responseText = await getChatResponse(chatHistory, chatInput);
+      const responseText = await getChatResponse(chatHistory, chatInput, user?.language || 'en');
       const modelMessage: ChatMessage = { role: 'model', text: responseText || "I'm sorry, I couldn't process that." };
       setChatHistory(prev => [...prev, modelMessage]);
     } catch (e) {
@@ -331,6 +558,26 @@ export default function App() {
     await handleLogDose(activeReminder.id);
     setActiveReminder(null);
   };
+
+  const handleGetInsight = async (med: any) => {
+    setIsInsightLoading(true);
+    try {
+      const content = await getMedicineInsights(
+        med.name, 
+        med.dosage, 
+        med.frequency, 
+        med.instructions,
+        LANGUAGES.find(l => l.code === user?.language)?.name || 'English'
+      );
+      setSelectedInsight({ name: med.name, content: content || "No insights available." });
+    } catch (e) {
+      console.error(e);
+      addToast("Failed to get AI insights", "error");
+    } finally {
+      setIsInsightLoading(false);
+    }
+  };
+
   const handleUpdateSound = async (sound: string, customData?: string) => {
     try {
       const res = await fetch('/api/user/settings', {
@@ -349,10 +596,30 @@ export default function App() {
           ...user, 
           reminder_sound: sound, 
           custom_sound_data: customData !== undefined ? customData : user?.custom_sound_data 
-        }, token!);
+        } as any, token!);
+        addToast("Settings saved", "success");
         
         // Small delay to ensure state is updated if we need to play custom sound
         setTimeout(() => playReminderSound(sound), 100);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleUpdateLanguage = async (langCode: string) => {
+    try {
+      const res = await fetch('/api/user/settings', {
+        method: 'PUT',
+        headers: { 
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ language: langCode }),
+      });
+      if (res.ok) {
+        setAuth({ ...user, language: langCode } as any, token!);
+        addToast(`Language updated to ${LANGUAGES.find(l => l.code === langCode)?.name}`, "success");
       }
     } catch (e) {
       console.error(e);
@@ -392,6 +659,7 @@ export default function App() {
       });
       if (res.ok) {
         fetchData();
+        addToast("Dose logged successfully!", "success");
       }
     } catch (e) {
       console.error(e);
@@ -422,6 +690,7 @@ export default function App() {
     try {
       const parsed = await parseMedicineInput(aiInput);
       await handleAddMedicine(parsed);
+      addToast(`Added ${parsed.name} successfully!`, 'success');
     } catch (e: any) {
       alert(e.message);
     } finally {
@@ -430,15 +699,41 @@ export default function App() {
   };
 
   const handleDeleteMedicine = async (id: number) => {
-    if (!confirm('Are you sure?')) return;
+    console.log(`[CLIENT] handleDeleteMedicine starting for ID: ${id}`);
+    
     try {
-      await fetch(`/api/medicines/${id}`, {
+      addToast("Deleting medicine...", "info");
+      
+      const res = await fetch(`/api/medicines/${id}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` },
       });
-      fetchData();
+      
+      console.log(`[CLIENT] Delete response status: ${res.status}`);
+      
+      let data: any = {};
+      const contentType = res.headers.get("content-type");
+      const text = await res.text();
+      
+      if (contentType && contentType.includes("application/json") && text) {
+        try {
+          data = JSON.parse(text);
+        } catch (e) {
+          console.error('[CLIENT] JSON parse error:', e);
+        }
+      }
+
+      if (res.ok) {
+        console.log('[CLIENT] Delete success, refreshing...');
+        addToast("Medicine removed", "success");
+        await fetchData();
+      } else {
+        console.error('[CLIENT] Delete failed:', data);
+        addToast(data.error || "Delete failed", "error");
+      }
     } catch (e) {
-      console.error(e);
+      console.error('[CLIENT] Network error:', e);
+      addToast("Connection error", "error");
     }
   };
 
@@ -539,19 +834,78 @@ export default function App() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-          {!notificationsEnabled && (
-            <button 
-              onClick={requestNotifications}
-              className="p-2 text-zinc-400 hover:text-emerald-500 transition-colors"
-              title="Enable Notifications"
-            >
-              <AlertCircle className="w-5 h-5" />
-            </button>
-          )}
+          <button 
+            onClick={() => setShowNotifications(!showNotifications)}
+            className="p-2 text-zinc-400 hover:text-emerald-600 transition-colors relative"
+          >
+            <Bell className="w-5 h-5" />
+            {notificationHistory.length > 0 && (
+              <span className="absolute top-1 right-1 w-2 h-2 bg-red-500 rounded-full border-2 border-white" />
+            )}
+          </button>
           <button onClick={logout} className="p-2 text-zinc-400 hover:text-red-500 transition-colors">
             <LogOut className="w-5 h-5" />
           </button>
         </div>
+
+        {/* Notification Dropdown */}
+        <AnimatePresence>
+          {showNotifications && (
+            <>
+              <div className="fixed inset-0 z-[15]" onClick={() => setShowNotifications(false)} />
+              <motion.div
+                initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                className="absolute top-16 right-6 w-72 bg-white rounded-2xl shadow-2xl border border-zinc-100 z-[20] overflow-hidden"
+              >
+                <div className="p-4 border-b border-zinc-50 flex items-center justify-between bg-zinc-50/50">
+                  <h3 className="font-bold text-sm">Recent Alerts</h3>
+                  <button 
+                    onClick={() => setNotificationHistory([])}
+                    className="text-[10px] uppercase font-bold text-zinc-400 hover:text-red-500 transition-colors"
+                  >
+                    Clear All
+                  </button>
+                </div>
+                <div className="max-h-80 overflow-y-auto">
+                  {notificationHistory.length === 0 ? (
+                    <div className="p-8 text-center">
+                      <Bell className="w-8 h-8 text-zinc-100 mx-auto mb-2" />
+                      <p className="text-xs text-zinc-400 mb-4">No recent alerts</p>
+                      <button 
+                        onClick={() => {
+                          addToast("Test Alert Triggered!", "info");
+                          playReminderSound(user?.reminder_sound);
+                          setNotificationHistory([{
+                            id: Date.now(),
+                            medName: "Test Medicine",
+                            dosage: "10mg",
+                            time: format(new Date(), 'HH:mm'),
+                            date: format(new Date(), 'yyyy-MM-dd')
+                          }]);
+                        }}
+                        className="text-[10px] uppercase font-bold text-emerald-600 hover:text-emerald-700"
+                      >
+                        Send Test Alert
+                      </button>
+                    </div>
+                  ) : (
+                    notificationHistory.map(item => (
+                      <div key={item.id} className="p-4 border-b border-zinc-50 last:border-0 hover:bg-zinc-50 transition-colors">
+                        <div className="flex justify-between items-start mb-1">
+                          <h4 className="font-bold text-sm text-zinc-900">{item.medName}</h4>
+                          <span className="text-[10px] text-zinc-400 font-medium">{item.time}</span>
+                        </div>
+                        <p className="text-xs text-zinc-500">Time for your {item.dosage} dose.</p>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </motion.div>
+            </>
+          )}
+        </AnimatePresence>
       </header>
 
       <main className="max-w-2xl mx-auto p-6 space-y-6">
@@ -575,7 +929,7 @@ export default function App() {
                     <Calendar className="w-8 h-8 text-zinc-300" />
                   </div>
                   <p className="text-zinc-500">No medicines added yet.</p>
-                  <Button variant="secondary" className="mt-4" onClick={() => setView('add')}>
+                  <Button variant="secondary" className="mt-4" onClick={() => { setView('add'); setEditingMedicine(null); }}>
                     Add your first medicine
                   </Button>
                 </Card>
@@ -596,10 +950,33 @@ export default function App() {
                               {isTakenToday ? <CheckCircle2 className="w-6 h-6" /> : <Clock className="w-6 h-6" />}
                             </div>
                             <div>
-                              <h4 className="font-bold text-lg">{med.name}</h4>
+                              <div className="flex items-center gap-2">
+                                <h4 className="font-bold text-lg">{med.name}</h4>
+                                <button 
+                                  onClick={() => handleGetInsight(med)}
+                                  className="p-1 text-emerald-500 hover:bg-emerald-50 rounded-lg transition-colors"
+                                  title="AI Insight"
+                                >
+                                  <Sparkles className="w-4 h-4" />
+                                </button>
+                              </div>
                               <p className="text-sm text-zinc-500">{med.dosage} • {med.frequency}</p>
                               {med.instructions && (
-                                <p className="text-xs text-zinc-400 mt-1 italic">"{med.instructions}"</p>
+                                <div className="mt-1 flex items-start gap-2">
+                                  <p className="text-xs text-zinc-400 italic flex-1">"{med.instructions}"</p>
+                                  {user?.language && user.language !== 'en' && (
+                                    <button 
+                                      onClick={async () => {
+                                        const translated = await translateText(med.instructions, LANGUAGES.find(l => l.code === user.language)?.name || 'English');
+                                        addToast(`Translated: ${translated}`, "info");
+                                      }}
+                                      className="p-1 text-zinc-300 hover:text-emerald-500 transition-colors"
+                                      title="Translate Instructions"
+                                    >
+                                      <Languages className="w-3 h-3" />
+                                    </button>
+                                  )}
+                                </div>
                               )}
                               {med.snoozed_until && parseISO(med.snoozed_until) > new Date() && (
                                 <p className="text-xs text-amber-600 mt-1 font-medium flex items-center gap-1">
@@ -631,13 +1008,15 @@ export default function App() {
                             <div className="flex items-center gap-1">
                               <button 
                                 onClick={() => handleEditClick(med)}
-                                className="p-1 text-zinc-300 hover:text-emerald-500 opacity-0 group-hover:opacity-100 transition-all"
+                                className="p-2 text-zinc-400 hover:text-emerald-600 transition-all"
+                                title="Edit"
                               >
                                 <Edit2 className="w-4 h-4" />
                               </button>
                               <button 
                                 onClick={() => handleDeleteMedicine(med.id)}
-                                className="p-1 text-zinc-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all"
+                                className="p-2 text-zinc-400 hover:text-red-500 transition-all"
+                                title="Delete"
                               >
                                 <Trash2 className="w-4 h-4" />
                               </button>
@@ -682,36 +1061,122 @@ export default function App() {
                 <div className="flex-1 min-h-0">
                   <ResponsiveContainer width="100%" height="100%" minHeight={200}>
                     <AreaChart data={analytics}>
-                    <defs>
-                      <linearGradient id="colorTaken" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="#10b981" stopOpacity={0.3}/>
-                        <stop offset="95%" stopColor="#10b981" stopOpacity={0}/>
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f4f4f5" />
-                    <XAxis 
-                      dataKey="date" 
-                      axisLine={false} 
-                      tickLine={false} 
-                      tick={{ fontSize: 10, fill: '#a1a1aa' }}
-                      tickFormatter={(val) => format(parseISO(val), 'MMM d')}
-                    />
-                    <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#a1a1aa' }} />
-                    <Tooltip 
-                      contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)' }}
-                    />
-                    <Area 
-                      type="monotone" 
-                      dataKey="taken" 
-                      stroke="#10b981" 
-                      fillOpacity={1} 
-                      fill="url(#colorTaken)" 
-                      strokeWidth={3}
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
+                      <defs>
+                        <linearGradient id="colorTaken" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#10b981" stopOpacity={0.3}/>
+                          <stop offset="95%" stopColor="#10b981" stopOpacity={0}/>
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f4f4f5" />
+                      <XAxis 
+                        dataKey="date" 
+                        axisLine={false} 
+                        tickLine={false} 
+                        tick={{ fontSize: 10, fill: '#a1a1aa' }}
+                        tickFormatter={(val) => format(parseISO(val), 'MMM d')}
+                      />
+                      <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 10, fill: '#a1a1aa' }} />
+                      <Tooltip 
+                        contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)' }}
+                      />
+                      <Area 
+                        type="monotone" 
+                        dataKey="taken" 
+                        stroke="#10b981" 
+                        fillOpacity={1} 
+                        fill="url(#colorTaken)" 
+                        strokeWidth={3}
+                      />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              </Card>
+
+              <div className="grid grid-cols-3 gap-4">
+                <Card className="flex flex-col items-center justify-center py-4">
+                  <div className="w-10 h-10 bg-orange-100 rounded-full flex items-center justify-center mb-2">
+                    <Zap className="w-5 h-5 text-orange-600" />
+                  </div>
+                  <span className="text-xl font-bold text-zinc-900">{adherenceStats.streak}</span>
+                  <span className="text-[10px] text-zinc-500 uppercase tracking-wider font-bold">Day Streak</span>
+                </Card>
+                <Card className="flex flex-col items-center justify-center py-4">
+                  <div className="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center mb-2">
+                    <AlertCircle className="w-5 h-5 text-red-600" />
+                  </div>
+                  <span className="text-xl font-bold text-zinc-900">{adherenceStats.missedLast7}</span>
+                  <span className="text-[10px] text-zinc-500 uppercase tracking-wider font-bold">Missed (7d)</span>
+                </Card>
+                <Card className="flex flex-col items-center justify-center py-4">
+                  <div className="w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center mb-2">
+                    <Calendar className="w-5 h-5 text-blue-600" />
+                  </div>
+                  <span className="text-sm font-bold text-zinc-900 truncate w-full text-center px-1">{adherenceStats.bestDay}</span>
+                  <span className="text-[10px] text-zinc-500 uppercase tracking-wider font-bold">Best Day</span>
+                </Card>
               </div>
-            </Card>
+
+              <Card className="p-6">
+                <h4 className="text-sm font-bold text-zinc-900 mb-6 flex items-center gap-2">
+                  <BarChart3 className="w-4 h-4 text-emerald-600" />
+                  Medicine Adherence Trends
+                </h4>
+                <div className="h-64">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={medicineAdherence} layout="vertical" margin={{ left: 20 }}>
+                      <XAxis type="number" hide />
+                      <YAxis 
+                        dataKey="name" 
+                        type="category" 
+                        axisLine={false} 
+                        tickLine={false} 
+                        tick={{ fontSize: 12, fill: '#4b5563', fontWeight: 500 }}
+                        width={80}
+                      />
+                      <Tooltip 
+                        cursor={{ fill: 'transparent' }}
+                        contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)' }}
+                      />
+                      <Bar 
+                        dataKey="taken" 
+                        fill="#10b981" 
+                        radius={[0, 4, 4, 0]} 
+                        barSize={20}
+                      />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </Card>
+
+              <Card className="p-6 bg-emerald-50 border-emerald-100">
+                <div className="flex items-center justify-between mb-4">
+                  <h4 className="text-sm font-bold text-emerald-900 flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-emerald-600" />
+                    AI Behavioral Insights
+                  </h4>
+                  <button 
+                    onClick={() => generateBehavioralInsights(behaviorAnalysis)}
+                    disabled={isBehaviorLoading}
+                    className="text-xs text-emerald-600 font-bold hover:underline disabled:opacity-50"
+                  >
+                    {isBehaviorLoading ? 'Analyzing...' : 'Refresh'}
+                  </button>
+                </div>
+                
+                {isBehaviorLoading ? (
+                  <div className="space-y-3">
+                    <div className="h-4 bg-emerald-200/50 rounded animate-pulse w-3/4" />
+                    <div className="h-4 bg-emerald-200/50 rounded animate-pulse w-full" />
+                    <div className="h-4 bg-emerald-200/50 rounded animate-pulse w-5/6" />
+                  </div>
+                ) : behavioralInsights ? (
+                  <div className="markdown-body text-sm text-emerald-800 leading-relaxed">
+                    <Markdown>{behavioralInsights}</Markdown>
+                  </div>
+                ) : (
+                  <p className="text-sm text-emerald-600 italic">No behavioral data available yet. Keep logging your doses to see patterns.</p>
+                )}
+              </Card>
 
               <div className="grid grid-cols-2 gap-4">
                 <Card className="flex flex-col items-center justify-center py-6">
@@ -730,7 +1195,7 @@ export default function App() {
 
           {view === 'add' && (
             <motion.div 
-              key="add"
+              key={editingMedicine ? `edit-${editingMedicine.id}` : 'add'}
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -20 }}
@@ -761,17 +1226,30 @@ export default function App() {
                         placeholder="Type instructions here..."
                         className="w-full bg-emerald-800/50 border border-emerald-700 rounded-xl px-4 py-3 text-white placeholder-emerald-400 outline-none focus:ring-2 focus:ring-emerald-400 min-h-[100px] resize-none"
                       />
-                      <button 
-                        onClick={handleAiParse}
-                        disabled={isAiParsing || !aiInput.trim()}
-                        className="absolute bottom-3 right-3 p-2 bg-emerald-500 hover:bg-emerald-400 rounded-lg transition-colors disabled:opacity-50"
-                      >
-                        {isAiParsing ? (
-                          <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                        ) : (
-                          <Send className="w-5 h-5" />
-                        )}
-                      </button>
+                      <div className="absolute bottom-3 right-3 flex gap-2">
+                        <button 
+                          onClick={() => startListening('ai')}
+                          disabled={isListening}
+                          className={cn(
+                            "p-2 rounded-lg transition-all",
+                            isListening ? "bg-red-500 animate-pulse" : "bg-emerald-700 hover:bg-emerald-600"
+                          )}
+                          title="Voice to Text"
+                        >
+                          {isListening ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+                        </button>
+                        <button 
+                          onClick={handleAiParse}
+                          disabled={isAiParsing || !aiInput.trim()}
+                          className="p-2 bg-emerald-500 hover:bg-emerald-400 rounded-lg transition-colors disabled:opacity-50"
+                        >
+                          {isAiParsing ? (
+                            <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                          ) : (
+                            <Send className="w-5 h-5" />
+                          )}
+                        </button>
+                      </div>
                     </div>
                   </div>
                   <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/10 rounded-full -mr-16 -mt-16 blur-3xl" />
@@ -782,9 +1260,12 @@ export default function App() {
               <form className="space-y-4" onSubmit={(e) => {
                 e.preventDefault();
                 const formData = new FormData(e.currentTarget);
-                const startDate = formData.get('start_date') as string;
-                const endDate = formData.get('end_date') as string;
+                const startDateVal = formData.get('start_date') as string;
+                const endDateVal = formData.get('end_date') as string;
                 
+                const parsedStartDate = startDateVal ? new Date(startDateVal) : null;
+                const parsedEndDate = endDateVal ? new Date(endDateVal) : null;
+
                 handleAddMedicine({
                   name: formData.get('name') as string,
                   dosage: formData.get('dosage') as string,
@@ -792,10 +1273,11 @@ export default function App() {
                   time_of_day: formData.get('time_of_day') as string,
                   instructions: formData.get('instructions') as string,
                   reminder_time: formData.get('reminder_time') as string,
-                  start_date: startDate ? new Date(startDate).toISOString() : undefined,
-                  end_date: endDate ? new Date(endDate).toISOString() : undefined,
+                  start_date: parsedStartDate && !isNaN(parsedStartDate.getTime()) ? parsedStartDate.toISOString() : undefined,
+                  end_date: parsedEndDate && !isNaN(parsedEndDate.getTime()) ? parsedEndDate.toISOString() : undefined,
                 } as any);
               }}>
+                <input type="hidden" name="time_of_day" defaultValue={editingMedicine?.time_of_day} />
                 <div className="grid grid-cols-2 gap-4">
                   <div className="col-span-2">
                     <label className="block text-sm font-medium text-zinc-700 mb-1">Medicine Name</label>
@@ -883,7 +1365,13 @@ export default function App() {
                       "p-3 rounded-2xl text-sm",
                       msg.role === 'user' ? "bg-emerald-600 text-white rounded-tr-none" : "bg-white border border-zinc-100 rounded-tl-none"
                     )}>
-                      {msg.text}
+                      {msg.role === 'user' ? (
+                        msg.text
+                      ) : (
+                        <div className="markdown-body">
+                          <Markdown>{msg.text}</Markdown>
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -907,15 +1395,28 @@ export default function App() {
                   onChange={(e) => setChatInput(e.target.value)}
                   onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
                   placeholder="Ask a question..."
-                  className="w-full px-4 py-3 pr-12 rounded-xl border border-zinc-200 outline-none focus:ring-2 focus:ring-emerald-500"
+                  className="w-full px-4 py-3 pr-24 rounded-xl border border-zinc-200 outline-none focus:ring-2 focus:ring-emerald-500"
                 />
-                <button 
-                  onClick={handleSendMessage}
-                  disabled={!chatInput.trim() || isChatLoading}
-                  className="absolute right-2 top-1.5 p-1.5 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition-colors disabled:opacity-50"
-                >
-                  <Send className="w-5 h-5" />
-                </button>
+                <div className="absolute right-2 top-1.5 flex gap-1">
+                  <button 
+                    onClick={() => startListening('chat')}
+                    disabled={isListening}
+                    className={cn(
+                      "p-1.5 rounded-lg transition-all",
+                      isListening ? "bg-red-500 text-white animate-pulse" : "text-zinc-400 hover:text-emerald-600 hover:bg-zinc-50"
+                    )}
+                    title="Voice to Text"
+                  >
+                    {isListening ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+                  </button>
+                  <button 
+                    onClick={handleSendMessage}
+                    disabled={!chatInput.trim() || isChatLoading}
+                    className="p-1.5 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition-colors disabled:opacity-50"
+                  >
+                    <Send className="w-5 h-5" />
+                  </button>
+                </div>
               </div>
             </motion.div>
           )}
@@ -992,22 +1493,29 @@ export default function App() {
               </Card>
 
               <Card className="p-6">
-                <div className="flex items-center justify-between mb-4">
-                  <div className="flex items-center gap-3">
-                    <Bell className="w-5 h-5 text-emerald-600" />
-                    <h4 className="font-bold">Notifications</h4>
-                  </div>
-                  <button 
-                    onClick={requestNotifications}
-                    className={cn(
-                      "px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-all",
-                      notificationsEnabled ? "bg-emerald-100 text-emerald-700" : "bg-zinc-100 text-zinc-500 hover:bg-zinc-200"
-                    )}
-                  >
-                    {notificationsEnabled ? "Enabled" : "Enable"}
-                  </button>
+                <div className="flex items-center gap-3 mb-2">
+                  <Languages className="w-5 h-5 text-emerald-600" />
+                  <h4 className="font-bold">App Language</h4>
                 </div>
-                <p className="text-sm text-zinc-500">Enable desktop notifications for your medicine reminders.</p>
+                <p className="text-sm text-zinc-500 mb-4">Select your preferred language for AI chat and translations.</p>
+                
+                <div className="grid grid-cols-2 gap-2">
+                  {LANGUAGES.map((lang) => (
+                    <button
+                      key={lang.code}
+                      onClick={() => handleUpdateLanguage(lang.code)}
+                      className={cn(
+                        "flex items-center justify-between p-3 rounded-xl border transition-all text-sm",
+                        user?.language === lang.code 
+                          ? "border-emerald-500 bg-emerald-50 text-emerald-700 font-bold" 
+                          : "border-zinc-100 hover:border-zinc-200"
+                      )}
+                    >
+                      <span>{lang.name}</span>
+                      {user?.language === lang.code && <CheckCircle2 className="w-4 h-4" />}
+                    </button>
+                  ))}
+                </div>
               </Card>
 
               <Card className="p-6">
@@ -1103,7 +1611,7 @@ export default function App() {
         </button>
         
         <button 
-          onClick={() => setView('add')}
+          onClick={() => { setView('add'); setEditingMedicine(null); }}
           className="w-14 h-14 bg-emerald-600 rounded-2xl flex items-center justify-center text-white shadow-lg shadow-emerald-200 -mt-10 border-4 border-zinc-50 active:scale-90 transition-all"
         >
           <Plus className="w-8 h-8" />
@@ -1142,6 +1650,92 @@ export default function App() {
           <span className="text-[10px] font-bold uppercase tracking-wider">Settings</span>
         </button>
       </nav>
+
+      {/* Toasts */}
+      <div className="fixed top-20 right-4 z-[60] flex flex-col gap-2 pointer-events-none">
+        <AnimatePresence>
+          {toasts.map(toast => (
+            <motion.div
+              key={toast.id}
+              initial={{ opacity: 0, x: 50, scale: 0.9 }}
+              animate={{ opacity: 1, x: 0, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.9 }}
+              className={cn(
+                "px-4 py-3 rounded-xl shadow-lg text-sm font-medium pointer-events-auto min-w-[200px] flex items-center gap-3",
+                toast.type === 'success' ? "bg-emerald-600 text-white" : 
+                toast.type === 'error' ? "bg-red-600 text-white" : 
+                "bg-zinc-900 text-white"
+              )}
+            >
+              {toast.type === 'success' && <CheckCircle2 className="w-4 h-4" />}
+              {toast.type === 'error' && <AlertCircle className="w-4 h-4" />}
+              {toast.type === 'info' && <Bell className="w-4 h-4" />}
+              {toast.message}
+            </motion.div>
+          ))}
+        </AnimatePresence>
+      </div>
+
+      {/* AI Insight Modal */}
+      <AnimatePresence>
+        {selectedInsight && (
+          <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="bg-white rounded-3xl w-full max-w-md overflow-hidden shadow-2xl"
+            >
+              <div className="p-6 border-b border-zinc-100 flex items-center justify-between bg-emerald-50/50">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-2xl bg-emerald-100 text-emerald-600 flex items-center justify-center">
+                    <Sparkles className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <h3 className="font-bold text-lg">{selectedInsight.name}</h3>
+                    <p className="text-xs text-emerald-600 font-bold uppercase tracking-wider">AI Insight</p>
+                  </div>
+                </div>
+                <button 
+                  onClick={() => setSelectedInsight(null)}
+                  className="p-2 hover:bg-zinc-100 rounded-full transition-colors"
+                >
+                  <X className="w-6 h-6 text-zinc-400" />
+                </button>
+              </div>
+              <div className="p-6 max-h-[60vh] overflow-y-auto">
+                <div className="markdown-body text-zinc-600 leading-relaxed">
+                  <Markdown>{selectedInsight.content}</Markdown>
+                </div>
+              </div>
+              <div className="p-6 border-t border-zinc-100 bg-zinc-50 flex justify-end">
+                <Button onClick={() => setSelectedInsight(null)}>Got it</Button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Global AI Loading Overlay */}
+      <AnimatePresence>
+        {isInsightLoading && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[80] bg-white/80 backdrop-blur-md flex flex-col items-center justify-center"
+          >
+            <div className="relative">
+              <div className="w-20 h-20 border-4 border-emerald-100 border-t-emerald-600 rounded-full animate-spin" />
+              <div className="absolute inset-0 flex items-center justify-center">
+                <Sparkles className="w-8 h-8 text-emerald-600 animate-pulse" />
+              </div>
+            </div>
+            <p className="mt-6 text-emerald-900 font-bold text-lg animate-pulse">Generating AI Insights...</p>
+            <p className="text-zinc-500 text-sm mt-2">Analyzing medication data & safety info</p>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
