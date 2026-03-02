@@ -93,6 +93,7 @@ export default function App() {
   const [logs, setLogs] = useState<any[]>([]);
   const [analytics, setAnalytics] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
+  const [dbError, setDbError] = useState<{ error: string, message: string } | null>(null);
   const [aiInput, setAiInput] = useState('');
   const [isAiParsing, setIsAiParsing] = useState(false);
   const [editingMedicine, setEditingMedicine] = useState<any>(null);
@@ -209,6 +210,53 @@ export default function App() {
     setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 5000);
   };
 
+  const authenticatedFetch = async (url: string, options: any = {}, retries = 50): Promise<Response> => {
+    try {
+      const headers: any = { ...options.headers };
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+      
+      const res = await fetch(url, {
+        ...options,
+        headers
+      });
+
+      const contentType = res.headers.get("content-type");
+      const isJson = contentType && contentType.includes("application/json");
+      
+      // Check if we hit the platform warmup page or a non-JSON response when we expect one
+      // (Most of our API calls expect JSON)
+      const text = await res.clone().text();
+      const isWarmup = text.includes("Please wait while your application starts") || 
+                       text.includes("Starting Server...") ||
+                       text.includes("warmup_start_time") ||
+                       text.includes("AI Studio Logo") ||
+                       text.includes("warmup") ||
+                       (text.includes("<!doctype html>") && url.startsWith('/api/'));
+
+      // Only retry on 503 if it's NOT JSON (likely platform issue, not our DB error)
+      const shouldRetry = isWarmup || (res.status === 503 && !isJson) || (!isJson && res.status === 200 && url.startsWith('/api/'));
+
+      if (shouldRetry) {
+        if (retries > 0) {
+          console.log(`[CLIENT] Hit warmup page or invalid response for ${url}, retrying in 4s... (${retries} retries left)`);
+          await new Promise(resolve => setTimeout(resolve, 4000));
+          return authenticatedFetch(url, options, retries - 1);
+        }
+      }
+
+      return res;
+    } catch (e) {
+      if (retries > 0) {
+        console.log(`[CLIENT] Fetch error for ${url}, retrying in 4s... (${retries} retries left)`, e);
+        await new Promise(resolve => setTimeout(resolve, 4000));
+        return authenticatedFetch(url, options, retries - 1);
+      }
+      throw e;
+    }
+  };
+
   const lastRemindedRef = useRef<{ [key: string]: string }>({});
   const medicinesRef = useRef<any[]>([]);
   const logsRef = useRef<any[]>([]);
@@ -230,7 +278,30 @@ export default function App() {
   useEffect(() => {
     const checkHealth = async () => {
       try {
-        const res = await fetch('/api/health');
+        // Use a simple fetch here as we don't need authentication for health check
+        // but we still want to handle the warmup page
+        const fetchHealth = async (retries = 30): Promise<Response> => {
+          const res = await fetch('/api/health');
+          const contentType = res.headers.get("content-type");
+          const isJson = contentType && contentType.includes("application/json");
+          const text = await res.clone().text();
+          
+          const isWarmup = text.includes("Please wait while your application starts") || 
+                           text.includes("Starting Server...") || 
+                           text.includes("<!doctype html>") || 
+                           text.includes("warmup_start_time") ||
+                           text.includes("warmup");
+          
+          if (isWarmup || (res.status === 503 && !isJson)) {
+            if (retries > 0) {
+              await new Promise(resolve => setTimeout(resolve, 4000));
+              return fetchHealth(retries - 1);
+            }
+          }
+          return res;
+        };
+
+        const res = await fetchHealth();
         if (res.ok) {
           const text = await res.text();
           if (!text) return;
@@ -240,8 +311,6 @@ export default function App() {
             const data = JSON.parse(text);
             console.log('API Health Check:', data);
           }
-        } else {
-          console.error('API Health Check returned non-OK status:', res.status);
         }
       } catch (e) {
         console.error('API Health Check failed:', e);
@@ -374,12 +443,22 @@ export default function App() {
   const fetchData = async () => {
     try {
       const [medsRes, logsRes, statsRes, userRes, behaviorRes] = await Promise.all([
-        fetch('/api/medicines', { headers: { Authorization: `Bearer ${token}` } }),
-        fetch('/api/logs', { headers: { Authorization: `Bearer ${token}` } }),
-        fetch('/api/analytics', { headers: { Authorization: `Bearer ${token}` } }),
-        fetch('/api/user/me', { headers: { Authorization: `Bearer ${token}` } }),
-        fetch('/api/behavior-analysis', { headers: { Authorization: `Bearer ${token}` } }),
+        authenticatedFetch('/api/medicines'),
+        authenticatedFetch('/api/logs'),
+        authenticatedFetch('/api/analytics'),
+        authenticatedFetch('/api/user/me'),
+        authenticatedFetch('/api/behavior-analysis'),
       ]);
+      
+      // Check for DB connection error (503)
+      const anyRes = [medsRes, logsRes, statsRes, userRes, behaviorRes].find(r => r.status === 503);
+      if (anyRes) {
+        const errorData = await anyRes.json();
+        setDbError(errorData);
+        return;
+      } else {
+        setDbError(null);
+      }
       
       const safeJson = async (res: Response) => {
         try {
@@ -445,11 +524,11 @@ export default function App() {
     const body = isLogin ? { email, password } : { email, password, name };
     
     try {
-      const res = await fetch(endpoint, {
+      const res = await authenticatedFetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-      });
+      }, 30); // Even more retries for auth
       
       const contentType = res.headers.get("content-type");
       const text = await res.text();
@@ -460,21 +539,22 @@ export default function App() {
           data = JSON.parse(text);
         } catch (e) {
           console.error('Failed to parse auth JSON:', e);
-          alert('Server returned invalid data. Please try again.');
+          addToast("Server returned invalid data. Retrying...", "error");
+          // If parsing fails, it might be a transient issue, but we already retried in authenticatedFetch
           return;
         }
         
         if (res.ok) {
           setAuth(data.user, data.token);
         } else {
-          alert(data.error || 'Auth failed');
+          addToast(data.error || 'Auth failed', "error");
         }
       } else {
         console.error('Non-JSON or empty response:', text);
-        alert('Server error. Please try again later.');
+        addToast("Server is still warming up. Please wait a moment and try again.", "info");
       }
     } catch (e) {
-      alert('Auth failed');
+      addToast("Connection failed. Please check your internet or try again later.", "error");
     } finally {
       setLoading(false);
     }
@@ -486,11 +566,10 @@ export default function App() {
       const method = editingMedicine ? 'PUT' : 'POST';
       const url = editingMedicine ? `/api/medicines/${editingMedicine.id}` : '/api/medicines';
       
-      const res = await fetch(url, {
+      const res = await authenticatedFetch(url, {
         method,
         headers: { 
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({
           ...parsed,
@@ -580,11 +659,10 @@ export default function App() {
 
   const handleUpdateSound = async (sound: string, customData?: string) => {
     try {
-      const res = await fetch('/api/user/settings', {
+      const res = await authenticatedFetch('/api/user/settings', {
         method: 'PUT',
         headers: { 
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({ 
           reminder_sound: sound,
@@ -609,11 +687,10 @@ export default function App() {
 
   const handleUpdateLanguage = async (langCode: string) => {
     try {
-      const res = await fetch('/api/user/settings', {
+      const res = await authenticatedFetch('/api/user/settings', {
         method: 'PUT',
         headers: { 
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({ language: langCode }),
       });
@@ -645,11 +722,10 @@ export default function App() {
 
   const handleLogDose = async (medicineId: number) => {
     try {
-      const res = await fetch('/api/logs', {
+      const res = await authenticatedFetch('/api/logs', {
         method: 'POST',
         headers: { 
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({
           medicine_id: medicineId,
@@ -668,11 +744,10 @@ export default function App() {
 
   const handleSnooze = async (medicineId: number, minutes: number = 15) => {
     try {
-      const res = await fetch(`/api/medicines/${medicineId}/snooze`, {
+      const res = await authenticatedFetch(`/api/medicines/${medicineId}/snooze`, {
         method: 'POST',
         headers: { 
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({ minutes }),
       });
@@ -704,9 +779,8 @@ export default function App() {
     try {
       addToast("Deleting medicine...", "info");
       
-      const res = await fetch(`/api/medicines/${id}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` },
+      const res = await authenticatedFetch(`/api/medicines/${id}`, {
+        method: 'DELETE'
       });
       
       console.log(`[CLIENT] Delete response status: ${res.status}`);
@@ -1654,6 +1728,20 @@ export default function App() {
       {/* Toasts */}
       <div className="fixed top-20 right-4 z-[60] flex flex-col gap-2 pointer-events-none">
         <AnimatePresence>
+          {dbError && (
+            <motion.div
+              initial={{ opacity: 0, x: 50, scale: 0.9 }}
+              animate={{ opacity: 1, x: 0, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.9 }}
+              className="bg-red-600 text-white p-4 rounded-xl shadow-xl border border-red-500 pointer-events-auto flex items-start gap-3 max-w-sm"
+            >
+              <AlertCircle className="w-6 h-6 shrink-0 mt-0.5" />
+              <div>
+                <h3 className="font-bold">{dbError.error}</h3>
+                <p className="text-xs opacity-90">{dbError.message}</p>
+              </div>
+            </motion.div>
+          )}
           {toasts.map(toast => (
             <motion.div
               key={toast.id}
