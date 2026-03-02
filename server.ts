@@ -13,16 +13,30 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const MONGODB_URI = process.env.MONGODB_URI;
-if (!MONGODB_URI) {
-  console.error("ERROR: MONGODB_URI is not defined in environment variables.");
-  process.exit(1);
-}
+let isDbConnected = false;
+
 const JWT_SECRET = process.env.JWT_SECRET || "medtrack-secret-key-123";
 
 // MongoDB Connection
-mongoose.connect(MONGODB_URI)
-  .then(() => console.log("Connected to MongoDB"))
-  .catch(err => console.error("MongoDB connection error:", err));
+async function connectToDatabase() {
+  if (!MONGODB_URI) {
+    console.error("⚠️ WARNING: MONGODB_URI is not defined. Database features will not work.");
+    return;
+  }
+  try {
+    await mongoose.connect(MONGODB_URI);
+    isDbConnected = true;
+    console.log("Connected to MongoDB successfully");
+  } catch (err: any) {
+    console.error("❌ CRITICAL: MongoDB connection failed!");
+    console.error("Error details:", err.message);
+    if (err.message.includes("authentication failed")) {
+      console.error("\nTIP: Your MongoDB password or username is incorrect.");
+      console.error("If your password contains special characters (like @, #, $), you MUST URL-encode them.");
+      console.error("Example: '@' becomes '%40', '#' becomes '%23'\n");
+    }
+  }
+}
 
 // Define Schemas
 const userSchema = new mongoose.Schema({
@@ -111,9 +125,23 @@ async function seedDatabase() {
 }
 
 async function startServer() {
-  await seedDatabase();
+  await connectToDatabase();
+  if (isDbConnected) {
+    await seedDatabase();
+  }
   const app = express();
   app.use(express.json());
+
+  // Database status middleware
+  app.use("/api", (req, res, next) => {
+    if (!isDbConnected && req.path !== "/health") {
+      return res.status(503).json({ 
+        error: "Database not connected", 
+        message: "The application is waiting for a valid MongoDB connection. Please check your MONGODB_URI environment variable." 
+      });
+    }
+    next();
+  });
 
   // Request logging
   app.use((req, res, next) => {
